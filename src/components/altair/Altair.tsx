@@ -16,10 +16,16 @@
 import { type FunctionDeclaration, SchemaType } from "@google/generative-ai";
 import { useEffect, useRef, useState, memo } from "react";
 import vegaEmbed from "vega-embed";
+import { ForeverVM, StandardOutput } from "@forevervm/sdk";
 import { useLiveAPIContext } from "../../contexts/LiveAPIContext";
-import { ToolCall } from "../../multimodal-live-types";
+import { LiveFunctionResponse, ToolCall } from "../../multimodal-live-types";
+import { generateReplToken } from "../../lib/forevervm";
 
-const declaration: FunctionDeclaration = {
+const fvm = new ForeverVM({ token: await generateReplToken() });
+
+const repl = fvm.repl();
+
+const renderAltair: FunctionDeclaration = {
   name: "render_altair",
   description: "Displays an altair graph in json format.",
   parameters: {
@@ -32,6 +38,22 @@ const declaration: FunctionDeclaration = {
       },
     },
     required: ["json_graph"],
+  },
+};
+
+const runPython: FunctionDeclaration = {
+  name: "run_python",
+  description:
+    "Run Python code in a stateful read-eval-print loop. Variables, imports, and functions are persisted between calls. Imports of common packages, including requests, matplotlib, and pandas, are permitted, but you may not install libraries.",
+  parameters: {
+    type: SchemaType.OBJECT,
+    properties: {
+      code: {
+        type: SchemaType.STRING,
+        description: "The Python code to run",
+      },
+    },
+    required: ["code"],
   },
 };
 
@@ -58,35 +80,46 @@ function AltairComponent() {
       tools: [
         // there is a free-tier quota for search
         { googleSearch: {} },
-        { functionDeclarations: [declaration] },
+        { functionDeclarations: [renderAltair, runPython] },
       ],
     });
   }, [setConfig]);
 
   useEffect(() => {
-    const onToolCall = (toolCall: ToolCall) => {
+    const onToolCall = async (toolCall: ToolCall) => {
       console.log(`got toolcall`, toolCall);
-      const fc = toolCall.functionCalls.find(
-        (fc) => fc.name === declaration.name,
-      );
-      if (fc) {
-        const str = (fc.args as any).json_graph;
-        setJSONString(str);
+
+      const functionResponses: LiveFunctionResponse[] = [];
+
+      for (const fc of toolCall.functionCalls) {
+        switch (fc?.name) {
+          case renderAltair.name: {
+            const str = (fc.args as any).json_graph;
+            setJSONString(str);
+            functionResponses.push({ id: fc.id, response: { output: { success: true } } });
+            break;
+          }
+
+          case runPython.name: {
+            const code = (fc.args as any).code;
+
+            const instruction = repl.exec(code);
+
+            let output: StandardOutput[] = [];
+            for await (const line of instruction.output) output.push(line);
+
+            const result = await repl.exec(code).result;
+
+            functionResponses.push({ id: fc.id, response: { output: { output, result } } });
+            break;
+          }
+        }
       }
+
       // send data for the response of your tool call
       // in this case Im just saying it was successful
-      if (toolCall.functionCalls.length) {
-        setTimeout(
-          () =>
-            client.sendToolResponse({
-              functionResponses: toolCall.functionCalls.map((fc) => ({
-                response: { output: { success: true } },
-                id: fc.id,
-              })),
-            }),
-          200,
-        );
-      }
+      if (functionResponses.length)
+        setTimeout(() => client.sendToolResponse({ functionResponses }), 200);
     };
     client.on("toolcall", onToolCall);
     return () => {
